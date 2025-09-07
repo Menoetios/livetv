@@ -6,23 +6,21 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from playwright.sync_api import sync_playwright
 import re
-import random
-import requests
-from urllib.parse import urljoin
 
 # ---------------- CONFIG ----------------
-FFMPEG_PATH = "/usr/bin/ffmpeg"           # Linux ffmpeg path
-USE_LOGO = True                           # Set to False to disable logo
-LOGO_PATH = "/home/space/logo.png"        # Absolute path to logo
-LOGO_POSITION = "top-left"                # Options: top-left, top-right, bottom-left, bottom-right
-LOGO_SCALE = 0.1                          # Logo width as fraction of video width
+FFMPEG_PATH = "/usr/bin/ffmpeg"
+USE_LOGO = False
+LOGO_PATH = "/app/logo.png"
+LOGO_POSITION = "top-left"
+LOGO_SCALE = 0.1
 MAKO_URL = "https://www.mako.co.il/culture-tv/articles/Article-c75a4149b6ef091027.htm"
-PORT = int(os.environ.get("PORT", 8080))  # Render requires dynamic port binding
-SEGMENT_DURATION = 30
-SEGMENT_LIST_SIZE = 45
-MAX_RETRIES = 5
-RETRY_DELAY = 5
-PLAYWRIGHT_TIMEOUT = 60000
+PORT = int(os.environ.get("PORT", 8080))
+SEGMENT_DURATION = 12
+SEGMENT_LIST_SIZE = 12
+MAX_RETRIES = 3
+RETRY_DELAY = 10
+PLAYWRIGHT_TIMEOUT = 30000
+TMP_DIR = "/tmp"
 # ----------------------------------------
 
 def get_overlay_position(position):
@@ -39,13 +37,12 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 class HTTPStreamHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
-        """Handle HEAD requests (Render health check)."""
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
 
     def do_GET(self):
-        if self.path == '/':
+        if self.path == '/' or self.path == '/health':
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             self.end_headers()
@@ -88,8 +85,14 @@ class HTTPStreamHandler(BaseHTTPRequestHandler):
 
     def handle_segment(self):
         try:
-            seg_num = int(re.search(r'segment(\d+).ts', self.path).group(1))
-            file_path = f"segment{seg_num:03d}.ts"
+            match = re.search(r'segment(\d+).ts', self.path)
+            if not match:
+                self.send_response(400)
+                self.end_headers()
+                return
+
+            seg_num = int(match.group(1))
+            file_path = os.path.join(TMP_DIR, f"segment{seg_num:03d}.ts")
             if not os.path.exists(file_path):
                 self.send_response(404)
                 self.end_headers()
@@ -112,8 +115,79 @@ class HTTPStreamHandler(BaseHTTPRequestHandler):
         except Exception as e:
             print(f"[ERROR] Failed to serve segment: {e}")
 
-# ---------------- (rest of your Playwright + ffmpeg logic unchanged) ----------------
-# keep your capture_m3u8_url, get_highest_quality_url, stream_worker, cleanup
+# ---------------- HELPERS ----------------
+def cleanup():
+    for f in os.listdir(TMP_DIR):
+        if f.startswith("segment") or f.endswith(".m3u8"):
+            try:
+                os.remove(os.path.join(TMP_DIR, f))
+            except FileNotFoundError:
+                pass
+
+def capture_m3u8_url(url):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--disable-gpu", "--no-sandbox"])
+        page = browser.new_page()
+        m3u8_url = None
+
+        def handle_response(response):
+            nonlocal m3u8_url
+            if ".m3u8" in response.url:
+                m3u8_url = response.url
+
+        page.on("response", handle_response)
+        page.goto(url, timeout=PLAYWRIGHT_TIMEOUT)
+        time.sleep(5)
+        browser.close()
+        return m3u8_url
+
+def stream_worker(server):
+    retry = 0
+    while retry < MAX_RETRIES:
+        try:
+            m3u8_url = capture_m3u8_url(MAKO_URL)
+            if not m3u8_url:
+                raise Exception("M3U8 not found")
+
+            print(f"[INFO] Streaming from {m3u8_url}")
+
+            ffmpeg_cmd = [
+                FFMPEG_PATH,
+                "-i", m3u8_url,
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "28",
+                "-r", "15",
+                "-c:a", "aac",
+                "-b:a", "64k",
+                "-ac", "1",
+                "-f", "hls",
+                "-hls_time", str(SEGMENT_DURATION),
+                "-hls_list_size", str(SEGMENT_LIST_SIZE),
+                "-hls_flags", "delete_segments+append_list+independent_segments",
+                "-hls_segment_filename", os.path.join(TMP_DIR, "segment%03d.ts"),
+                os.path.join(TMP_DIR, "playlist.m3u8")
+            ]
+
+            proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            while proc.poll() is None:
+                with server.lock:
+                    segs = [
+                        int(re.search(r"segment(\d+).ts", f).group(1))
+                        for f in os.listdir(TMP_DIR) if f.startswith("segment")
+                    ]
+                    server.available_segments = set(segs)
+                time.sleep(1)
+
+        except Exception as e:
+            print(f"[ERROR] Stream worker failed: {e}")
+            retry += 1
+            time.sleep(RETRY_DELAY)
+        finally:
+            cleanup()
+
+    print("[FATAL] Max retries reached, exiting stream worker.")
 
 # ---------------- MAIN ----------------
 def main():
